@@ -1,4 +1,11 @@
-# bot.py (REBUILD) — Volume DB, no movie/serial lists, captions show downloads for everyone
+# bot.py (FINAL)
+# ✅ Admin kino videosini caption bilan yuboradi (Kino nomi - Tavsif)
+# ✅ Keyin bot alohida CODE (ID) so'raydi va unikligini tekshiradi
+# ✅ Serial: nom -> tavsif -> keyin CODE so'raladi (unik tekshiradi)
+# ✅ Listlar yo'q (movie_list/serial_list yo'q)
+# ✅ Hamma userga captionda: "⬇️ Yuklab olingan: X marta" ko'rinadi
+# ✅ /start va subscription success textlari siz aytgandek qisqa
+
 import os
 import asyncio
 import logging
@@ -31,7 +38,7 @@ if not TOKEN:
 if not ADMIN_ID:
     raise ValueError("ADMIN_ID .env da yo'q yoki 0!")
 
-# Ensure DB directory exists (needed for volume paths like /app/data/bot_data.db)
+# Ensure DB directory exists (for volume paths like /app/data/bot_data.db)
 _db_dir = os.path.dirname(DB_PATH)
 if _db_dir:
     os.makedirs(_db_dir, exist_ok=True)
@@ -59,7 +66,6 @@ def get_utc_now():
 
 def normalize_channel_identifier(text: str) -> str:
     t = (text or "").strip()
-
     if "t.me/" in t:
         part = t.split("t.me/", 1)[1].strip()
         part = part.split("?", 1)[0].strip().strip("/")
@@ -68,28 +74,34 @@ def normalize_channel_identifier(text: str) -> str:
         if not part.startswith("@"):
             part = "@" + part
         return part
-
     return t
 
 
 def safe_caption(base: str, description: str = "") -> str:
-    """
-    Telegram video caption limit ~1024 chars. Truncate description safely.
-    """
+    """Telegram caption max ~1024"""
     base = (base or "").strip()
     desc = (description or "").strip()
     if not desc:
         return base
-
     prefix = "\n📝 "
     extra = prefix + desc
     if len(base) + len(extra) <= CAPTION_LIMIT:
         return base + extra
-
     allowed = CAPTION_LIMIT - len(base) - len(prefix) - 1
     if allowed <= 0:
         return base
     return base + prefix + desc[:allowed] + "…"
+
+
+def parse_title_desc(text: str) -> tuple[str, str]:
+    """
+    Expected: "Title - Desc" or "Title"
+    """
+    t = (text or "").strip()
+    if " - " in t:
+        a, b = t.split(" - ", 1)
+        return a.strip(), b.strip()
+    return t, ""
 
 
 # ===================== STATES =====================
@@ -107,15 +119,21 @@ class AdminStates(StatesGroup):
 
     broadcast = State()
 
-    wait_for_serial_id = State()
+    # Movie: video+caption -> ask code
+    add_movie_video = State()
+    add_movie_code = State()
+
+    # Serial: name -> desc -> ask code
+    add_serial_name = State()
+    add_serial_description = State()
+    add_serial_code = State()
+
+    # Serial part
+    wait_for_serial_code = State()
     wait_for_part_video = State()
 
+    # Remove by code
     remove_content = State()
-
-    add_movie = State()
-
-    add_serial = State()
-    add_serial_description = State()
 
 
 # ===================== DATABASE =====================
@@ -152,15 +170,19 @@ class DatabaseManager:
                 )
             """)
 
+            # content.id = internal PK
+            # content.code = custom code (unique)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS content (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code INTEGER,
                     file_id TEXT,
                     title TEXT,
                     description TEXT,
                     content_type TEXT DEFAULT 'movie',
                     added_by INTEGER,
-                    added_at TEXT
+                    added_at TEXT,
+                    downloads_count INTEGER DEFAULT 0
                 )
             """)
 
@@ -215,7 +237,7 @@ class DatabaseManager:
 
             await db.commit()
 
-            # ---- ALTER safe adds ----
+            # add missing columns if old DB
             try:
                 await db.execute("ALTER TABLE users ADD COLUMN started_once INTEGER DEFAULT 0")
                 await db.commit()
@@ -228,8 +250,16 @@ class DatabaseManager:
             except:
                 pass
 
+            # unique index for code
             try:
-                await db.execute("ALTER TABLE content ADD COLUMN downloads_count INTEGER DEFAULT 0")
+                await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_content_code ON content(code)")
+                await db.commit()
+            except:
+                pass
+
+            # if any old rows have NULL code, set code=id (safe)
+            try:
+                await db.execute("UPDATE content SET code = id WHERE code IS NULL")
                 await db.commit()
             except:
                 pass
@@ -348,7 +378,7 @@ class DatabaseManager:
             )
             return await cur.fetchone() is not None
 
-    # ---------- INSTAGRAM LINKS ----------
+    # ---------- INSTAGRAM ----------
     async def add_instagram_link(self, title: str, url: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
@@ -371,40 +401,60 @@ class DatabaseManager:
             return [{"id": r[0], "title": r[1], "url": r[2]} for r in rows]
 
     # ---------- CONTENT ----------
-    async def add_content(self, file_id: Optional[str], title: str, description: str, content_type: str, added_by: int) -> int:
+    async def code_exists(self, code: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT 1 FROM content WHERE code=?", (code,))
+            return await cur.fetchone() is not None
+
+    async def add_movie(self, code: int, file_id: str, title: str, description: str, added_by: int) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             try:
                 cur = await db.execute(
-                    """INSERT INTO content (file_id, title, description, content_type, added_by, added_at, downloads_count)
-                       VALUES (?, ?, ?, ?, ?, ?, COALESCE(?,0))""",
-                    (file_id, title, description, content_type, added_by, get_utc_now().isoformat(), 0)
+                    """INSERT INTO content (code, file_id, title, description, content_type, added_by, added_at, downloads_count)
+                       VALUES (?, ?, ?, ?, 'movie', ?, ?, 0)""",
+                    (code, file_id, title, description, added_by, get_utc_now().isoformat())
                 )
                 await db.commit()
                 return cur.lastrowid
             except Exception as e:
-                logger.error(f"Error adding content: {e}")
+                logger.error(f"add_movie error: {e}")
                 return 0
 
-    async def get_content(self, content_id: int) -> Optional[Dict]:
+    async def add_serial(self, code: int, title: str, description: str, added_by: int) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                cur = await db.execute(
+                    """INSERT INTO content (code, file_id, title, description, content_type, added_by, added_at, downloads_count)
+                       VALUES (?, NULL, ?, ?, 'serial', ?, ?, 0)""",
+                    (code, title, description, added_by, get_utc_now().isoformat())
+                )
+                await db.commit()
+                return cur.lastrowid
+            except Exception as e:
+                logger.error(f"add_serial error: {e}")
+                return 0
+
+    async def get_content_by_code(self, code: int) -> Optional[Dict]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                "SELECT id, file_id, title, description, content_type, COALESCE(downloads_count,0) "
-                "FROM content WHERE id=?",
-                (content_id,)
+                "SELECT id, code, file_id, title, description, content_type, COALESCE(downloads_count,0) "
+                "FROM content WHERE code=?",
+                (code,)
             )
             row = await cur.fetchone()
             if not row:
                 return None
             return {
                 "id": row[0],
-                "file_id": row[1],
-                "title": row[2],
-                "description": row[3],
-                "content_type": row[4],
-                "downloads_count": row[5],
+                "code": row[1],
+                "file_id": row[2],
+                "title": row[3],
+                "description": row[4],
+                "content_type": row[5],
+                "downloads_count": row[6],
             }
 
-    async def delete_content(self, content_id: int) -> bool:
+    async def delete_content_by_internal_id(self, content_id: int) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM serial_parts WHERE serial_id = ?", (content_id,))
             await db.execute("DELETE FROM content_downloads WHERE content_id = ?", (content_id,))
@@ -421,53 +471,49 @@ class DatabaseManager:
             res = await cur.fetchone()
             return res[0] if res else 0
 
-    async def register_download(self, content_id: int, user_id: int) -> bool:
-        """
-        Unique download:
-        1 user -> 1 count
-        """
+    async def register_download(self, internal_content_id: int, user_id: int) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 "INSERT OR IGNORE INTO content_downloads (content_id, user_id, downloaded_at) VALUES (?, ?, ?)",
-                (content_id, user_id, get_utc_now().isoformat())
+                (internal_content_id, user_id, get_utc_now().isoformat())
             )
             await db.commit()
             if cur.rowcount > 0:
                 await db.execute(
                     "UPDATE content SET downloads_count = COALESCE(downloads_count,0) + 1 WHERE id=?",
-                    (content_id,)
+                    (internal_content_id,)
                 )
                 await db.commit()
                 return True
             return False
 
     # ---------- SERIAL PARTS ----------
-    async def add_serial_part(self, serial_id: int, part_number: int, file_id: str, title: str, added_by: int) -> bool:
+    async def add_serial_part(self, serial_internal_id: int, part_number: int, file_id: str, title: str, added_by: int) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             try:
                 await db.execute(
                     """INSERT INTO serial_parts (serial_id, part_number, file_id, title, added_by, added_at)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (serial_id, part_number, file_id, title, added_by, get_utc_now().isoformat())
+                    (serial_internal_id, part_number, file_id, title, added_by, get_utc_now().isoformat())
                 )
                 await db.commit()
                 return True
             except Exception as e:
-                logger.error(f"Error adding serial part: {e}")
+                logger.error(f"add_serial_part error: {e}")
                 return False
 
-    async def get_serial_parts(self, serial_id: int) -> List[Dict]:
+    async def get_serial_parts(self, serial_internal_id: int) -> List[Dict]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 "SELECT part_number, file_id, title FROM serial_parts WHERE serial_id=? ORDER BY part_number",
-                (serial_id,)
+                (serial_internal_id,)
             )
             rows = await cur.fetchall()
             return [{"part_number": r[0], "file_id": r[1], "title": r[2]} for r in rows]
 
-    async def get_serial_parts_count(self, serial_id: int) -> int:
+    async def get_serial_parts_count(self, serial_internal_id: int) -> int:
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT COUNT(*) FROM serial_parts WHERE serial_id=?", (serial_id,))
+            cur = await db.execute("SELECT COUNT(*) FROM serial_parts WHERE serial_id=?", (serial_internal_id,))
             res = await cur.fetchone()
             return res[0] if res else 0
 
@@ -511,10 +557,6 @@ db = DatabaseManager(DB_PATH)
 
 # ===================== SUBSCRIPTION CHECK =====================
 async def check_subscription(user_id: int) -> List[Dict]:
-    """
-    - kanallar bo'yicha obunani tekshiradi
-    - private kanal join request yuborgan bo'lsa vaqtincha OK
-    """
     channels = await db.get_channels()
     not_subscribed = []
 
@@ -560,35 +602,15 @@ async def on_join_request(update: ChatJoinRequest):
         logger.error(f"join_request save error: {e}")
 
 
-# ===================== ADMIN NOTIFY =====================
-async def send_admin_notification(user, action: str = "start"):
-    admins = await db.get_admins()
-    msg = (
-        f"👤 Foydalanuvchi:\n"
-        f"ID: {user.id}\n"
-        f"Ism: {user.first_name or 'N/A'}\n"
-        f"Username: @{user.username or 'N/A'}\n"
-        f"Harakat: /{action}\n"
-        f"Vaqt(UTC): {get_utc_now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    for a in admins:
-        try:
-            await bot.send_message(a["user_id"], msg)
-        except:
-            pass
-
-
-# ===================== START / ADMIN =====================
+# ===================== START =====================
 @router.message(CommandStart())
 async def start_handler(message: Message):
     user = message.from_user
     await db.add_user(user)
-    await send_admin_notification(user, "start")
 
     instagram_links = await db.get_instagram_links()
     channels = await db.get_channels()
 
-    # subscription check only for non-admin
     if channels and not await db.is_admin(user.id):
         not_subscribed = await check_subscription(user.id)
         if not_subscribed:
@@ -619,6 +641,7 @@ async def check_subscription_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+# ===================== ADMIN PANEL =====================
 @router.message(Command("admin"))
 async def admin_command_handler(message: Message):
     if not await db.is_admin(message.from_user.id):
@@ -627,7 +650,6 @@ async def admin_command_handler(message: Message):
     await show_admin_panel(message)
 
 
-# ===================== ADMIN PANEL UI =====================
 async def show_admin_panel(message: Union[Message, CallbackQuery]):
     stats = await db.get_statistics()
     channels = await db.get_channels()
@@ -641,12 +663,11 @@ async def show_admin_panel(message: Union[Message, CallbackQuery]):
         [InlineKeyboardButton(text=f"🎬 Kontent ({stats['movies_count'] + stats['serials_count']})", callback_data="content_manage")],
         [InlineKeyboardButton(text="📢 Xabar yuborish", callback_data="broadcast")]
     ]
-    text = "🛠 Admin Panel"
 
     if isinstance(message, Message):
-        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await message.answer("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     else:
-        await message.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        await message.message.edit_text("🛠 Admin Panel", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 @router.callback_query(F.data == "back_to_main")
@@ -689,7 +710,7 @@ async def add_admin_process(message: Message, state: FSMContext):
     try:
         uid = int((message.text or "").strip())
         ok = await db.add_admin(uid)
-        await message.answer("✅ Admin qo'shildi." if ok else "❌ Qo'shilmadi (mavjud bo'lishi mumkin).")
+        await message.answer("✅ Admin qo'shildi." if ok else "❌ Qo'shilmadi.")
     except:
         await message.answer("❌ Faqat raqam yuboring.")
     await state.clear()
@@ -741,10 +762,7 @@ async def instagram_manage(callback: CallbackQuery):
 @router.callback_query(F.data == "ig_add")
 async def ig_add(callback: CallbackQuery, state: FSMContext):
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-    await callback.message.edit_text(
-        "Instagram link uchun nom yozing (masalan: Mella Luxe):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
-    )
+    await callback.message.edit_text("Instagram link uchun nom yozing (masalan: Mella Luxe):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(AdminStates.add_instagram_title)
 
 
@@ -752,10 +770,7 @@ async def ig_add(callback: CallbackQuery, state: FSMContext):
 async def ig_add_title(message: Message, state: FSMContext):
     await state.update_data(ig_title=(message.text or "").strip())
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-    await message.answer(
-        "Endi Instagram URL yuboring (https://instagram.com/...):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
-    )
+    await message.answer("Endi Instagram URL yuboring (https://instagram.com/...):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(AdminStates.add_instagram_url)
 
 
@@ -778,10 +793,7 @@ async def ig_add_url(message: Message, state: FSMContext):
 @router.callback_query(F.data == "ig_remove")
 async def ig_remove(callback: CallbackQuery, state: FSMContext):
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-    await callback.message.edit_text(
-        "O'chirish uchun Instagram link ID yuboring:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
-    )
+    await callback.message.edit_text("O'chirish uchun Instagram link ID yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(AdminStates.remove_instagram)
 
 
@@ -849,8 +861,8 @@ async def add_channel_process(message: Message, state: FSMContext):
             return
 
         chat = await bot.get_chat(ident)
-
         await state.update_data(chat_id=chat.id, title=chat.title, username=chat.username or "")
+
         await message.answer(
             "✅ Endi kanal uchun invite link yuboring.\n"
             "Agar public kanal bo'lsa va @username bor bo'lsa, 'skip' deb yuboring.\n"
@@ -870,8 +882,8 @@ async def add_channel_invite_process(message: Message, state: FSMContext):
     if invite.lower() == "skip":
         invite = ""
     data = await state.get_data()
-
     await db.add_channel(data["chat_id"], data["title"], data["username"], invite)
+
     await message.answer(f"✅ Kanal qo'shildi: {data['title']}")
     await state.clear()
     await show_admin_panel(message)
@@ -896,7 +908,7 @@ async def remove_channel_process(message: Message, state: FSMContext):
     await show_admin_panel(message)
 
 
-# ===================== STATISTICS (ADMIN PANEL) =====================
+# ===================== STATS =====================
 @router.callback_query(F.data == "stats")
 async def show_stats(callback: CallbackQuery):
     stats = await db.get_statistics()
@@ -933,43 +945,73 @@ async def content_manage(callback: CallbackQuery):
     )
 
 
-# ---- Add Movie ----
+# ---- ADD MOVIE: Step1 video+caption -> Step2 ask code ----
 @router.callback_query(F.data == "add_movie")
 async def add_movie_handler(callback: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("❌")
+        return
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
     await callback.message.edit_text(
-        "🎬 Kino qo'shish uchun video yuboring.\n\n"
-        "Caption: Kino nomi - tavsif\n"
-        "Misol: Interstellar - Fantastika",
+        "🎬 Kino qo'shish:\n"
+        "Video yuboring.\n\n"
+        "Caption format:\n"
+        "Interstellar - Fantastika\n"
+        "(tavsif ixtiyoriy)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
-    await state.set_state(AdminStates.add_movie)
+    await state.set_state(AdminStates.add_movie_video)
 
 
-@router.message(AdminStates.add_movie, F.video)
-async def handle_movie_upload(message: Message, state: FSMContext):
+@router.message(AdminStates.add_movie_video, F.video)
+async def add_movie_receive_video(message: Message, state: FSMContext):
     if not await db.is_admin(message.from_user.id):
-        await message.answer("❌ Faqat adminlar qo'shadi.")
+        await message.answer("❌ Faqat adminlar.")
         return
 
-    video = message.video
-    caption = message.caption or ""
+    caption = (message.caption or "").strip()
+    if not caption:
+        await message.answer("❌ Caption yozing.\nMisol: Interstellar - Fantastika")
+        return
 
-    if " - " in caption:
-        title, description = caption.split(" - ", 1)
-        title = title.strip()
-        description = description.strip()
-    else:
-        title = caption.strip() or f"Kino #{await db.get_content_count('movie') + 1}"
-        description = ""
+    title, desc = parse_title_desc(caption)
+    if not title:
+        await message.answer("❌ Kino nomi bo'sh.\nMisol: Interstellar - Fantastika")
+        return
 
-    content_id = await db.add_content(video.file_id, title, description, "movie", message.from_user.id)
-    if content_id:
-        await message.answer(
-            f"✅ Kino qo'shildi!\n\nID: {content_id}\nNomi: {title}\n"
-            f"{('Tavsif: ' + description) if description else ''}\n\n"
-            f"Userlar {content_id} yuborib ko'radi."
-        )
+    await state.update_data(movie_file_id=message.video.file_id, movie_title=title, movie_desc=desc)
+    kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
+    await message.answer(
+        f"✅ Qabul qilindi: {title}\n\nEndi kino uchun CODE (raqam) yuboring.\nMasalan: 1001",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await state.set_state(AdminStates.add_movie_code)
+
+
+@router.message(AdminStates.add_movie_code)
+async def add_movie_receive_code(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
+        return
+
+    t = (message.text or "").strip()
+    if not t.isdigit():
+        await message.answer("❌ Faqat raqam yuboring. Masalan: 1001")
+        return
+
+    code = int(t)
+    if await db.code_exists(code):
+        await message.answer(f"❌ Bu CODE band: {code}\nBoshqa raqam tanlang.")
+        return
+
+    data = await state.get_data()
+    file_id = data["movie_file_id"]
+    title = data["movie_title"]
+    desc = data.get("movie_desc", "")
+
+    internal_id = await db.add_movie(code, file_id, title, desc, message.from_user.id)
+    if internal_id:
+        await message.answer(f"✅ Kino saqlandi.\nKod: {code}\nNomi: {title}")
     else:
         await message.answer("❌ Xatolik: saqlanmadi.")
 
@@ -977,41 +1019,73 @@ async def handle_movie_upload(message: Message, state: FSMContext):
     await show_admin_panel(message)
 
 
-# ---- Add Serial (name then desc, no video) ----
+# ---- ADD SERIAL: name -> desc -> ask code ----
 @router.callback_query(F.data == "add_serial")
 async def add_serial_handler(callback: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("❌")
+        return
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
     await callback.message.edit_text("📺 Serial nomini yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await state.set_state(AdminStates.add_serial)
+    await state.set_state(AdminStates.add_serial_name)
 
 
-@router.message(AdminStates.add_serial)
-async def process_serial_name(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ Matn yuboring.")
+@router.message(AdminStates.add_serial_name)
+async def add_serial_name(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
         return
-    title = message.text.strip()
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("❌ Serial nomi bo'sh.")
+        return
     await state.update_data(serial_title=title)
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-    await message.answer(f"📝 '{title}' uchun tavsif yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer("📝 Endi serial uchun tavsif yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(AdminStates.add_serial_description)
 
 
 @router.message(AdminStates.add_serial_description)
-async def process_serial_description(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("❌ Matn yuboring.")
+async def add_serial_desc(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
         return
+    desc = (message.text or "").strip()
     data = await state.get_data()
     title = data["serial_title"]
-    description = message.text.strip()
 
-    serial_id = await db.add_content(None, title, description, "serial", message.from_user.id)
-    if serial_id:
-        await message.answer(
-            f"✅ Serial qo'shildi!\n\nID: {serial_id}\nNomi: {title}\nTavsif: {description}\n\n"
-            "Endi 'Serialga qism qo'shish' orqali qismlar qo'shasiz."
-        )
+    await state.update_data(serial_desc=desc)
+    kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
+    await message.answer(
+        f"✅ Qabul qilindi: {title}\n\nEndi serial uchun CODE (raqam) yuboring.\nMasalan: 2001",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await state.set_state(AdminStates.add_serial_code)
+
+
+@router.message(AdminStates.add_serial_code)
+async def add_serial_code(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
+        return
+
+    t = (message.text or "").strip()
+    if not t.isdigit():
+        await message.answer("❌ Faqat raqam yuboring. Masalan: 2001")
+        return
+
+    code = int(t)
+    if await db.code_exists(code):
+        await message.answer(f"❌ Bu CODE band: {code}\nBoshqa raqam tanlang.")
+        return
+
+    data = await state.get_data()
+    title = data["serial_title"]
+    desc = data.get("serial_desc", "")
+
+    internal_id = await db.add_serial(code, title, desc, message.from_user.id)
+    if internal_id:
+        await message.answer(f"✅ Serial saqlandi.\nKod: {code}\nNomi: {title}")
     else:
         await message.answer("❌ Xatolik: saqlanmadi.")
 
@@ -1019,72 +1093,100 @@ async def process_serial_description(message: Message, state: FSMContext):
     await show_admin_panel(message)
 
 
-# ---- Add Serial Part ----
+# ---- ADD SERIAL PART ----
 @router.callback_query(F.data == "add_serial_part")
 async def add_serial_part_handler(callback: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("❌")
+        return
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-    await callback.message.edit_text("Qism qo'shish uchun serial kodini yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await state.set_state(AdminStates.wait_for_serial_id)
+    await callback.message.edit_text("Qism qo'shish uchun SERIAL CODE yuboring (masalan: 2001):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await state.set_state(AdminStates.wait_for_serial_code)
 
 
-@router.message(AdminStates.wait_for_serial_id)
-async def process_serial_id(message: Message, state: FSMContext):
-    try:
-        serial_id = int((message.text or "").strip())
-        serial = await db.get_content(serial_id)
-        if not serial or serial["content_type"] != "serial":
-            await message.answer("❌ Bunday serial topilmadi.")
-            return
+@router.message(AdminStates.wait_for_serial_code)
+async def receive_serial_code_for_part(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
+        return
 
-        parts_count = await db.get_serial_parts_count(serial_id)
-        next_part = parts_count + 1
-        await state.update_data(serial_id=serial_id, next_part=next_part)
+    t = (message.text or "").strip()
+    if not t.isdigit():
+        await message.answer("❌ Faqat raqam (CODE) yuboring.")
+        return
 
-        kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-        await message.answer(
-            f"📺 Serial: {serial['title']}\n"
-            f"🔢 Keyingi qism: {next_part}\n\n"
-            "Endi video yuboring.\nCaption ixtiyoriy: qism nomi",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
-        )
-        await state.set_state(AdminStates.wait_for_part_video)
-    except:
-        await message.answer("❌ Faqat raqam yuboring.")
+    code = int(t)
+    serial = await db.get_content_by_code(code)
+    if not serial or serial["content_type"] != "serial":
+        await message.answer("❌ Bunday serial topilmadi.")
+        return
+
+    parts_count = await db.get_serial_parts_count(serial["id"])
+    next_part = parts_count + 1
+
+    await state.update_data(serial_internal_id=serial["id"], serial_code=code, next_part=next_part)
+
+    kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
+    await message.answer(
+        f"📺 Serial: {serial['title']}\n"
+        f"Kod: {code}\n"
+        f"🔢 Keyingi qism: {next_part}\n\n"
+        "Endi video yuboring.\nCaption ixtiyoriy: qism nomi",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await state.set_state(AdminStates.wait_for_part_video)
 
 
 @router.message(AdminStates.wait_for_part_video, F.video)
-async def process_part_video(message: Message, state: FSMContext):
+async def receive_part_video(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
+        return
+
     data = await state.get_data()
-    serial_id = data["serial_id"]
+    serial_internal_id = data["serial_internal_id"]
+    serial_code = data["serial_code"]
     part_number = data["next_part"]
     title = (message.caption or f"{part_number}-qism").strip()
 
-    ok = await db.add_serial_part(serial_id, part_number, message.video.file_id, title, message.from_user.id)
-    await message.answer("✅ Qism qo'shildi!" if ok else "❌ Qism saqlanmadi.")
+    ok = await db.add_serial_part(serial_internal_id, part_number, message.video.file_id, title, message.from_user.id)
+    await message.answer(f"✅ Qism qo'shildi! (Kod: {serial_code}, Qism: {part_number})" if ok else "❌ Qism saqlanmadi.")
     await state.clear()
     await show_admin_panel(message)
 
 
-# ---- Remove content ----
+# ---- REMOVE CONTENT by CODE ----
 @router.callback_query(F.data == "remove_content")
 async def remove_content_handler(callback: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("❌")
+        return
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
-    await callback.message.edit_text("O'chirish uchun kod yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.message.edit_text("O'chirish uchun kontent CODE yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(AdminStates.remove_content)
 
 
 @router.message(AdminStates.remove_content)
 async def remove_content_process(message: Message, state: FSMContext):
-    try:
-        cid = int((message.text or "").strip())
-        content = await db.get_content(cid)
-        if not content:
-            await message.answer("❌ Kontent topilmadi.")
-        else:
-            ok = await db.delete_content(cid)
-            await message.answer("✅ O'chirildi." if ok else "❌ O'chmadi.")
-    except:
-        await message.answer("❌ Faqat raqam yuboring.")
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
+        return
+
+    t = (message.text or "").strip()
+    if not t.isdigit():
+        await message.answer("❌ Faqat raqam (CODE) yuboring.")
+        return
+
+    code = int(t)
+    content = await db.get_content_by_code(code)
+    if not content:
+        await message.answer("❌ Kontent topilmadi.")
+        await state.clear()
+        await show_admin_panel(message)
+        return
+
+    ok = await db.delete_content_by_internal_id(content["id"])
+    await message.answer("✅ O'chirildi." if ok else "❌ O'chmadi.")
     await state.clear()
     await show_admin_panel(message)
 
@@ -1092,6 +1194,9 @@ async def remove_content_process(message: Message, state: FSMContext):
 # ===================== BROADCAST =====================
 @router.callback_query(F.data == "broadcast")
 async def broadcast_handler(callback: CallbackQuery, state: FSMContext):
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer("❌")
+        return
     kb = [[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_action")]]
     await callback.message.edit_text("Barcha foydalanuvchilarga yuboriladigan xabarni yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await state.set_state(AdminStates.broadcast)
@@ -1099,6 +1204,10 @@ async def broadcast_handler(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.broadcast)
 async def broadcast_process(message: Message, state: FSMContext):
+    if not await db.is_admin(message.from_user.id):
+        await message.answer("❌ Faqat adminlar.")
+        return
+
     users = await db.get_all_users()
     await message.answer(f"📢 Yuborilmoqda... ({len(users)} user)")
 
@@ -1123,9 +1232,8 @@ async def handle_content_code(message: Message):
     user = message.from_user
     await db.update_user_activity(user.id)
 
-    content_id = int(message.text.strip())
+    code = int((message.text or "").strip())
 
-    # subscription check for non-admin
     if not await db.is_admin(user.id):
         channels = await db.get_channels()
         if channels:
@@ -1136,16 +1244,15 @@ async def handle_content_code(message: Message):
                 await message.answer("❌ Avval kanallarga obuna bo'ling:", reply_markup=kb)
                 return
 
-    content = await db.get_content(content_id)
+    content = await db.get_content_by_code(code)
     if not content:
-        await message.answer(f"❌ {content_id} kodli kontent topilmadi.")
+        await message.answer(f"❌ {code} kodli kontent topilmadi.")
         return
 
-    # unique download (do not count admin clicks)
     counted = False
     if not await db.is_admin(user.id):
         try:
-            counted = await db.register_download(content_id, user.id)
+            counted = await db.register_download(content["id"], user.id)
         except Exception as e:
             logger.error(f"register_download error: {e}")
 
@@ -1154,22 +1261,17 @@ async def handle_content_code(message: Message):
     if content["content_type"] == "movie":
         base = (
             f"🎬 {content['title']}\n"
-            f"🔗 ID: {content['id']}\n"
+            f"🔢 Kod: {content['code']}\n"
             f"⬇️ Yuklab olingan: {downloads_now} marta"
         )
         caption = safe_caption(base, content.get("description", ""))
         try:
-            await message.answer_video(
-                video=content["file_id"],
-                caption=caption,
-                protect_content=True
-            )
+            await message.answer_video(video=content["file_id"], caption=caption, protect_content=True)
         except:
             await message.answer("❌ Xatolik: Kino yuborilmadi.")
         return
 
-    # serial
-    parts = await db.get_serial_parts(content_id)
+    parts = await db.get_serial_parts(content["id"])
     if not parts:
         await message.answer("❌ Bu serialda hali qismlar yo'q.")
         return
@@ -1179,7 +1281,7 @@ async def handle_content_code(message: Message):
 
     base = (
         f"📺 {content['title']} - {current_part['title']}\n"
-        f"🔗 ID: {content_id}\n"
+        f"🔢 Kod: {content['code']}\n"
         f"🔢 Qism: {part_number}/{len(parts)}\n"
         f"⬇️ Yuklab olingan: {downloads_now} marta"
     )
@@ -1187,7 +1289,7 @@ async def handle_content_code(message: Message):
 
     keyboard = []
     if len(parts) > 1:
-        keyboard.append([InlineKeyboardButton(text="➡️ Keyingi qism", callback_data=f"serial_{content_id}_2")])
+        keyboard.append([InlineKeyboardButton(text="➡️ Keyingi qism", callback_data=f"serial_{content['code']}_2")])
 
     await message.answer_video(
         video=current_part["file_id"],
@@ -1199,7 +1301,6 @@ async def handle_content_code(message: Message):
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_non_code(message: Message):
-    # Any non-command, non-numeric text
     await message.answer("❌ Iltimos, faqat kod yuboring (1,2,3...).")
 
 
@@ -1207,9 +1308,9 @@ async def handle_non_code(message: Message):
 @router.callback_query(F.data.startswith("serial_"))
 async def handle_serial_navigation(callback: CallbackQuery):
     try:
-        _, sid, pno = callback.data.split("_")
-        serial_id = int(sid)
-        part_number = int(pno)
+        _, code_str, pno_str = callback.data.split("_")
+        serial_code = int(code_str)
+        part_number = int(pno_str)
     except:
         await callback.answer("❌ Xatolik.")
         return
@@ -1222,12 +1323,12 @@ async def handle_serial_navigation(callback: CallbackQuery):
                 await callback.answer("❌ Avval obuna bo'ling.")
                 return
 
-    content = await db.get_content(serial_id)
+    content = await db.get_content_by_code(serial_code)
     if not content or content["content_type"] != "serial":
         await callback.answer("❌ Serial topilmadi.")
         return
 
-    parts = await db.get_serial_parts(serial_id)
+    parts = await db.get_serial_parts(content["id"])
     if not parts or part_number < 1 or part_number > len(parts):
         await callback.answer("❌ Qism topilmadi.")
         return
@@ -1236,7 +1337,7 @@ async def handle_serial_navigation(callback: CallbackQuery):
 
     base = (
         f"📺 {content['title']} - {current_part['title']}\n"
-        f"🔗 ID: {serial_id}\n"
+        f"🔢 Kod: {content['code']}\n"
         f"🔢 Qism: {part_number}/{len(parts)}\n"
         f"⬇️ Yuklab olingan: {content['downloads_count']} marta"
     )
@@ -1245,9 +1346,9 @@ async def handle_serial_navigation(callback: CallbackQuery):
     keyboard = []
     row = []
     if part_number > 1:
-        row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"serial_{serial_id}_{part_number-1}"))
+        row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"serial_{content['code']}_{part_number-1}"))
     if part_number < len(parts):
-        row.append(InlineKeyboardButton(text="➡️ Keyingi", callback_data=f"serial_{serial_id}_{part_number+1}"))
+        row.append(InlineKeyboardButton(text="➡️ Keyingi", callback_data=f"serial_{content['code']}_{part_number+1}"))
     if row:
         keyboard.append(row)
 
